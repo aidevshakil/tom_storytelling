@@ -1,0 +1,212 @@
+# app/services/memory_services_mongodb.py
+
+import uuid, datetime, re, random
+from typing import Dict, List, Optional
+from app.questions.questions import QUESTION_BANK
+from app.core.database import memories_collection, user_phases_collection
+
+
+class MongoMemoryService:
+    
+    def _generate_snippet(self, response: str, max_length: int = 120) -> str:
+        if not response:
+            return ""
+        sentence = re.split(r'(?<=[.!?]) +', response.strip())[0]
+        snippet = sentence.strip()
+        if len(snippet) > max_length:
+            snippet = snippet[:max_length].rsplit(" ", 1)[0] + "..."
+        return snippet
+
+    # ─── Phase Handling ───────────────────────────
+    async def get_phase(self, user_id: str, session_id: str) -> str:
+        doc = await user_phases_collection.find_one({"user_id": user_id, "session_id": session_id})
+        return doc["current_phase"] if doc else None
+
+    async def set_phase(self, user_id: str, session_id: str, phase: str):
+        await user_phases_collection.update_one(
+            {"user_id": user_id, "session_id": session_id},
+            {"$set": {"current_phase": phase, "updated_at": datetime.datetime.now().isoformat()}},
+            upsert=True
+        )
+
+    def detect_initial_phase(self, text: str) -> str:
+        """Detect appropriate starting phase from user's first input."""
+        text_lower = text.lower()
+        
+        # Check age first (most accurate)
+        age_match = re.search(r'\b(\d{1,2})\s*(?:years?|yrs?)\s*old\b', text_lower)
+        if age_match:
+            age = int(age_match.group(1))
+            if age <= 12: return "childhood"
+            if age <= 19: return "teenage years"
+            if age <= 30: return "early adulthood"
+            if age <= 50: return "career work"
+            return "later life & reflections"
+        
+        # Check for exact phrase matches first (most specific)
+        exact_phrases = {
+            "teenage years": "teenage years",
+            "early adulthood": "early adulthood",
+            "career work": "career work",
+            "relationships & family": "relationships & family",
+            "hobbies & adventures": "hobbies & adventures",
+            "home & community": "home & community",
+            "challenges & growth": "challenges & growth",
+            "later life & reflections": "later life & reflections"
+        }
+        
+        for phrase, category in exact_phrases.items():
+            if phrase in text_lower:
+                return category
+        
+        # Then check keywords (removed weak keywords)
+        stage_map = {
+            "teenage years": ["teenage", "teen", "adolescent", "high school", "secondary school", "teenager"],
+            "early adulthood": ["early adult", "young adult", "university", "college", "twenties"],
+            "career work": ["career", "professional", "office", "business"],
+            "relationships & family": ["married", "wedding", "spouse", "partner", "family life"],
+            "hobbies & adventures": ["travel", "adventure", "vacation", "journey"],
+            "home & community": ["neighborhood", "community", "hometown"],
+            "challenges & growth": ["struggle", "overcome", "hardship"],
+            "later life & reflections": ["retired", "retirement", "grandchildren"],
+            "childhood": ["childhood", "elementary", "primary school"]
+        }
+        
+        for phase, keywords in stage_map.items():
+            if any(kw in text_lower for kw in keywords):
+                return phase
+        
+        vague_intents = ["share", "tell", "talk about", "memory", "story", "life"]
+        if any(intent in text_lower for intent in vague_intents) and len(text.split()) < 10:
+            return "ASK_USER"
+        
+        return "ASK_USER"
+
+    # ─── Memory Management ────────────────────────
+    async def add_memory(self, user_id: str, session_id: str, category: str,
+                   question: str, response: str, photos=None, audio_clips=None, contributors=None, photo_caption=None, display_text: Optional[str] = None):
+        photos = photos or []
+        audio_clips = audio_clips or []
+        contributors = contributors or []
+
+        snippet = self._generate_snippet(response)
+        
+        # Calculate depth score
+        from app.services.depth_scorer import depth_scorer
+        depth_data = depth_scorer.calculate_depth_score(response) if response else None
+        
+        entry = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "category": category,
+            "question": question,
+            "response": response,
+            "display_text": display_text,
+            "snippet": snippet,
+            "depth_score": depth_data["total_score"] if depth_data else 0,
+            "depth_level": depth_data["depth_level"] if depth_data else "Minimal",
+            "depth_breakdown": depth_data["breakdown"] if depth_data else None,
+            "photos": photos,
+            "photo_caption": photo_caption,
+            "audio_clips": audio_clips,
+            "contributors": contributors,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+        result = await memories_collection.insert_one(entry)
+        return str(result.inserted_id)
+
+    async def get_user_sessions(self, user_id: str):
+        """Return all session IDs for a user."""
+        sessions = await memories_collection.distinct("session_id", {"user_id": user_id})
+        return sessions
+
+    async def get_user_memories(self, user_id: str, session_id: str):
+        """Get all memories grouped by category."""
+        memories = await memories_collection.find({"user_id": user_id, "session_id": session_id}).to_list(None)
+        
+        # Group by category
+        grouped = {}
+        for mem in memories:
+            category = mem.get("category", "uncategorized")
+            if category not in grouped:
+                grouped[category] = []
+            grouped[category].append(mem)
+        
+        return grouped
+
+    async def get_category_memories(self, user_id: str, session_id: str, category: str):
+        memories = await memories_collection.find({
+            "user_id": user_id,
+            "session_id": session_id,
+            "category": category
+        }).to_list(None)
+        return memories
+
+    async def clear_session(self, user_id: str, session_id: str):
+        await memories_collection.delete_many({"user_id": user_id, "session_id": session_id})
+        await user_phases_collection.delete_one({"user_id": user_id, "session_id": session_id})
+
+    async def get_formatted_history(self, user_id: str, session_id: str) -> dict:
+        session_data = await self.get_user_memories(user_id, session_id)
+        formatted_lines = []
+        last_question = None
+        all_memories = []
+        
+        for category, memories in session_data.items():
+            formatted_lines.append(f"--- {category.upper()} ---")
+            for mem in memories:
+                formatted_lines.append(f"Q: {mem['question']}")
+                formatted_lines.append(f"A: {mem['response']}\n")
+                all_memories.append(mem)
+        
+        # Find last unanswered question (iterate from end)
+        for mem in reversed(all_memories):
+            if mem.get('question') and not mem.get('response', '').strip():
+                last_question = mem['question']
+                break
+        
+        return {
+            "formatted_history": "\n".join(formatted_lines),
+            "last_question": last_question
+        }
+
+    # ─── Progress Tracking ────────────────────────
+    async def get_progress(self, user_id: str, session_id: str) -> Dict[str, int]:
+        """Calculate completion percentage for each category based on core questions only."""
+        session_data = await self.get_user_memories(user_id, session_id)
+        progress = {}
+        DEFAULT_TARGET = 5
+        
+        for category in QUESTION_BANK.keys():
+            category_memories = session_data.get(category, [])
+            
+            # Check if ADD_MORE_PROMPT exists (phase complete)
+            has_add_more = any(m.get("question") == "ADD_MORE_PROMPT" for m in category_memories)
+            
+            if has_add_more:
+                progress[category] = 100
+            else:
+                core_questions = QUESTION_BANK[category]["questions"] if category in QUESTION_BANK else []
+                # Count only answered core questions
+                answered = len([m for m in category_memories 
+                              if m["response"].strip() and m["question"] in core_questions])
+                total_questions = len(core_questions) if core_questions else DEFAULT_TARGET
+                progress[category] = round((answered / total_questions) * 100) if total_questions > 0 else 0
+        
+        return progress
+
+    async def get_overall_progress(self, user_id: str, session_id: str) -> float:
+        """Calculate overall completion percentage."""
+        progress = await self.get_progress(user_id, session_id)
+        return round(sum(progress.values()) / len(progress), 1) if progress else 0.0
+
+    async def add_message(self, user_id: str, session_id: str, role: str, content: str):
+        """Add assistant message to memory."""
+        category = await self.get_phase(user_id, session_id)
+        if role == "Assistant" and category:
+            await self.add_memory(user_id, session_id, category, content, "")
+
+
+# Singleton instance
+mongo_memory_service = MongoMemoryService()
